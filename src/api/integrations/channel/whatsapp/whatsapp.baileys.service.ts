@@ -62,6 +62,7 @@ import { ChannelStartupService } from '@api/services/channel.service';
 import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
 import { CacheEngine } from '@cache/cacheengine';
 import {
+  AudioConverter,
   CacheConf,
   Chatwoot,
   ConfigService,
@@ -444,7 +445,7 @@ export class BaileysStartupService extends ChannelStartupService {
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
         this.instance.profilePictureUrl = profilePic.profilePictureUrl;
-      } catch (error) {
+      } catch {
         this.instance.profilePictureUrl = null;
       }
       const formattedWuid = this.instance.wuid.split('@')[0].padEnd(30, ' ');
@@ -523,7 +524,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       return webMessageInfo[0].message;
-    } catch (error) {
+    } catch {
       return { conversation: '' };
     }
   }
@@ -596,7 +597,7 @@ export class BaileysStartupService extends ChannelStartupService {
           const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
           const proxyUrl = 'http://' + proxyUrls[rand];
           options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgent(proxyUrl) };
-        } catch (error) {
+        } catch {
           this.localProxy.enabled = false;
         }
       } else {
@@ -1188,7 +1189,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   where: { id: existingChat.id },
                   data: { name: received.pushName },
                 });
-              } catch (error) {
+              } catch {
                 console.log(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
               }
             }
@@ -1204,6 +1205,8 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.documentWithCaptionMessage ||
             received?.message?.ptvMessage ||
             received?.message?.audioMessage;
+
+          const isVideo = received?.message?.videoMessage;
 
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
             await this.client.readMessages([received.key]);
@@ -1275,6 +1278,12 @@ export class BaileysStartupService extends ChannelStartupService {
             if (isMedia) {
               if (this.configService.get<S3>('S3').ENABLE) {
                 try {
+                  if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
+                    this.logger.warn('Video upload is disabled. Skipping video upload.');
+                    // Skip video upload by returning early from this block
+                    return;
+                  }
+
                   const message: any = received;
 
                   // Verificação adicional para garantir que há conteúdo de mídia real
@@ -1352,7 +1361,8 @@ export class BaileysStartupService extends ChannelStartupService {
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
           }
-          console.log(messageRaw);
+
+          this.logger.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
@@ -1554,7 +1564,7 @@ export class BaileysStartupService extends ChannelStartupService {
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
               try {
                 await this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert });
-              } catch (error) {
+              } catch {
                 console.log(`Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`);
               }
             }
@@ -1822,7 +1832,7 @@ export class BaileysStartupService extends ChannelStartupService {
       const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
 
       return { wuid: jid, profilePictureUrl };
-    } catch (error) {
+    } catch {
       return { wuid: jid, profilePictureUrl: null };
     }
   }
@@ -1832,7 +1842,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     try {
       return { wuid: jid, status: (await this.client.fetchStatus(jid))[0]?.status };
-    } catch (error) {
+    } catch {
       return { wuid: jid, status: null };
     }
   }
@@ -1881,7 +1891,7 @@ export class BaileysStartupService extends ChannelStartupService {
           website: business?.website?.shift(),
         };
       }
-    } catch (error) {
+    } catch {
       return { wuid: jid, name: null, picture: null, status: null, os: null, isBusiness: false };
     }
   }
@@ -2121,7 +2131,7 @@ export class BaileysStartupService extends ChannelStartupService {
           if (!cache.REDIS.ENABLED && !cache.LOCAL.ENABLED) group = await this.findGroup({ groupJid: sender }, 'inner');
           else group = await this.getGroupMetadataCache(sender);
           // group = await this.findGroup({ groupJid: sender }, 'inner');
-        } catch (error) {
+        } catch {
           throw new NotFoundException('Group not found');
         }
 
@@ -2171,6 +2181,8 @@ export class BaileysStartupService extends ChannelStartupService {
         messageSent?.message?.ptvMessage ||
         messageSent?.message?.audioMessage;
 
+      const isVideo = messageSent?.message?.videoMessage;
+
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled && !isIntegration) {
         this.chatwootService.eventWhatsapp(
           Events.SEND_MESSAGE,
@@ -2195,6 +2207,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (isMedia && this.configService.get<S3>('S3').ENABLE) {
           try {
+            if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
+              throw new Error('Video upload is disabled.');
+            }
+
             const message: any = messageRaw;
 
             // Verificação adicional para garantir que há conteúdo de mídia real
@@ -2593,6 +2609,13 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
+      if (mediaMessage?.fileName) {
+        mimetype = mimeTypes.lookup(mediaMessage.fileName).toString();
+        if (mimetype === 'application/mp4') {
+          mimetype = 'video/mp4';
+        }
+      }
+
       prepareMedia[mediaType].caption = mediaMessage?.caption;
       prepareMedia[mediaType].mimetype = mimetype;
       prepareMedia[mediaType].fileName = mediaMessage.fileName;
@@ -2819,7 +2842,8 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async processAudio(audio: string): Promise<Buffer> {
-    if (process.env.API_AUDIO_CONVERTER) {
+    const audioConverterConfig = this.configService.get<AudioConverter>('AUDIO_CONVERTER');
+    if (audioConverterConfig.API_URL) {
       this.logger.verbose('Using audio converter API');
       const formData = new FormData();
 
@@ -2829,8 +2853,8 @@ export class BaileysStartupService extends ChannelStartupService {
         formData.append('base64', audio);
       }
 
-      const { data } = await axios.post(process.env.API_AUDIO_CONVERTER, formData, {
-        headers: { ...formData.getHeaders(), apikey: process.env.API_AUDIO_CONVERTER_KEY },
+      const { data } = await axios.post(audioConverterConfig.API_URL, formData, {
+        headers: { ...formData.getHeaders(), apikey: audioConverterConfig.API_KEY },
       });
 
       if (!data.audio) {
@@ -3613,7 +3637,7 @@ export class BaileysStartupService extends ChannelStartupService {
           {},
           { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
         );
-      } catch (err) {
+      } catch {
         this.logger.error('Download Media failed, trying to retry in 5 seconds...');
         await new Promise((resolve) => setTimeout(resolve, 5000));
         const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));
@@ -4203,7 +4227,7 @@ export class BaileysStartupService extends ChannelStartupService {
   public async inviteInfo(id: GroupInvite) {
     try {
       return await this.client.groupGetInviteInfo(id.inviteCode);
-    } catch (error) {
+    } catch {
       throw new NotFoundException('No invite info', id.inviteCode);
     }
   }
@@ -4226,7 +4250,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       return { send: true, inviteUrl };
-    } catch (error) {
+    } catch {
       throw new NotFoundException('No send invite');
     }
   }
@@ -4690,7 +4714,7 @@ export class BaileysStartupService extends ChannelStartupService {
         collectionsLength: collections?.length,
         collections: collections,
       };
-    } catch (error) {
+    } catch {
       return { wuid: jid, name: null, isBusiness: false };
     }
   }
@@ -4712,12 +4736,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async fetchMessages(query: Query<Message>) {
-    const keyFilters = query?.where?.key as {
-      id?: string;
-      fromMe?: boolean;
-      remoteJid?: string;
-      participants?: string;
-    };
+    const keyFilters = query?.where?.key as ExtendedIMessageKey;
 
     const timestampFilter = {};
     if (query?.where?.messageTimestamp) {
@@ -4740,7 +4759,13 @@ export class BaileysStartupService extends ChannelStartupService {
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
           keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+          {
+            OR: [
+              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+              keyFilters?.senderPn ? { key: { path: ['senderPn'], equals: keyFilters?.senderPn } } : {},
+            ],
+          },
         ],
       },
     });
@@ -4764,7 +4789,13 @@ export class BaileysStartupService extends ChannelStartupService {
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
           keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+          {
+            OR: [
+              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+              keyFilters?.senderPn ? { key: { path: ['senderPn'], equals: keyFilters?.senderPn } } : {},
+            ],
+          },
         ],
       },
       orderBy: { messageTimestamp: 'desc' },
